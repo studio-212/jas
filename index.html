@@ -187,8 +187,703 @@ h2{font:600 15px/1.2 var(--sans);letter-spacing:-.01em;margin:0 0 4px}
 
 <div class="toast" id="toast"></div>
 
-<script type="module">
-import { PALETTES, STATE, Shader } from './ground-core.js';
+<script>
+/* --- engine, inlined so this file stands alone --- */
+const PALETTES = {
+  shore:[
+    [[0.043,0.043,0.071],[0.18,0.482,0.878],[0.498,0.776,0.961],[0.09,0.275,0.627],[0.929,0.953,0.969],[0.31,0.827,0.91]],
+    [[0.039,0.051,0.039],[0.486,0.82,0.102],[0.718,0.902,0.227],[0.118,0.42,0.227],[0.929,0.957,0.894],[0.247,0.749,0.478]],
+    [[0.031,0.047,0.063],[0.086,0.78,0.753],[0.165,0.357,0.843],[0.498,0.89,0.878],[0.902,0.957,0.961],[0.561,0.498,0.91]],
+    [[0.063,0.039,0.047],[0.902,0.133,0.133],[1,0.353,0.169],[1,0.69,0.125],[0.969,0.929,0.894],[0.18,0.482,0.878]],
+    [[0.047,0.047,0.031],[1,0.769,0],[1,0.478,0.102],[0.059,0.431,0.478],[0.961,0.941,0.878],[0.608,0.847,0.165]]
+  ],
+  earth:[
+    [[0.071,0.043,0.031],[1,0.478,0.102],[1,0.69,0.125],[0.561,0.227,0.071],[0.969,0.933,0.886],[0.31,0.69,0.416]],
+    [[0.059,0.039,0.039],[0.878,0.227,0.165],[1,0.541,0.361],[0.478,0.118,0.078],[0.961,0.918,0.886],[0.784,0.847,0.29]],
+    [[0.051,0.047,0.031],[1,0.824,0.227],[0.941,0.604,0.118],[0.243,0.361,0.102],[0.969,0.945,0.863],[0.878,0.337,0.165]],
+    [[0.063,0.047,0.039],[0.839,0.251,0.18],[1,0.682,0.235],[0.18,0.42,0.29],[0.961,0.929,0.878],[0.604,0.847,0.29]],
+    [[0.043,0.051,0.039],[0.718,0.902,0.227],[0.361,0.769,0.416],[0.878,0.639,0.165],[0.949,0.949,0.878],[0.878,0.337,0.227]]
+  ]
+};
+// How much each pigment granulates into the tooth of the paper.
+const GRAIN_OF = [0.10, 0.30, 0.45, 0.70, 0.25, 0.55];
+// Shared, mutable, and exported as one object so both the comparison page
+// and the colour editor drive the same engine rather than drifting apart.
+const STATE = { pal:'shore', key:'light', texture:1 };
+// 0 none, 1 paper, 2 wash — natural, and applied to the pigment not over it
+const TEXNAMES = ['no texture','paper','wash'];
+
+const inks = sty => {
+  const set = PALETTES[STATE.pal][Math.max(0, sty)];
+  return STATE.key === 'light' ? set : set.map(c => c.map(v => v * 0.62));
+};
+const PAPER = () => (STATE.key === 'light' ? [0.955, 0.945, 0.915] : [0.72, 0.74, 0.73]);
+
+const NV = 8;      // vortices shed by the hand
+
+// A vortex is a piece of fluid, not a coordinate. Left as a fixed point it sits
+// anchored to the spot, which is nothing like a whirl made by a hand in water —
+// that one wanders, sways, gets carried by the current around it and pulled
+// about by its neighbours. So the flow has to exist on this side too, roughly
+// matching the shader's ambient, just well enough to carry a point around.
+const jh = (x, y) => { const v = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return v - Math.floor(v); };
+function jn(x, y){
+  const ix = Math.floor(x), iy = Math.floor(y);
+  let fx = x - ix, fy = y - iy;
+  fx = fx * fx * (3 - 2 * fx); fy = fy * fy * (3 - 2 * fy);
+  const a = jh(ix, iy), b = jh(ix + 1, iy), c = jh(ix, iy + 1), d = jh(ix + 1, iy + 1);
+  return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+}
+const jpsi = (x, y, t) => jn(x * 1.15, y * 1.15 + t * 0.035) * 0.085
+                        + jn(x * 2.90 - t * 0.028, y * 2.90) * 0.030;
+function jcurl(x, y, t){
+  const e = 0.004;
+  return [ (jpsi(x, y + e, t) - jpsi(x, y - e, t)) / (2 * e),
+          -(jpsi(x + e, y, t) - jpsi(x - e, y, t)) / (2 * e) ];
+}
+const NW = 14;     // ripples alive at once
+
+const VERT = `#version 300 es
+in vec2 a; void main(){ gl_Position = vec4(a, 0.0, 1.0); }`;
+
+/* ---------- shared by both passes ---------- */
+const COMMON = `
+precision highp float;
+uniform vec2 uRes; uniform float uAsp;
+
+vec2 h2(vec2 p){
+  p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
+  return fract(sin(p) * 43758.5453);
+}
+float h21(vec2 p){ return fract(sin(dot(p, vec2(41.3, 289.1))) * 43758.5453); }
+float hash(vec2 p){ return fract(sin(dot(p, vec2(41.3, 289.1))) * 43758.5453); }
+float vnoise(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1,0)), f.x),
+             mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), f.x), f.y);
+}
+float fbm(vec2 p){
+  return 0.55 * vnoise(p) + 0.28 * vnoise(p * 2.3) + 0.17 * vnoise(p * 4.9);
+}
+vec2 toUV(vec2 p){ return vec2(p.x / uAsp, p.y); }
+`;
+
+/* ---------- pass one: move the ink ---------- */
+const SIM = `#version 300 es
+${COMMON}
+out vec4 o;
+uniform sampler2D uPrev;
+uniform float uT, uDt, uAmb, uFirst, uRegen;
+uniform int   uStyle;
+uniform vec4  uHand;               // xy where, zw heading
+uniform vec2  uHandM;              // strength, radius
+uniform vec4  uVort[${NV}];        // xy where, z circulation, w radius
+uniform vec4  uRipA[${NW}];        // xy where, z amplitude, w radius
+uniform vec2  uRipB[${NW}];        // wavenumber, phase
+uniform vec3  uInk[6];
+uniform float uGrainOf[6];
+
+/* --- the stream function, and its curl --- */
+// Turbulence: fractal noise used as a potential, so its curl is a
+// divergence-free flow with structure at every scale.
+float psiAmb(vec2 p){
+  return fbm(p * 1.15 + vec2(0.0, uT * 0.035)) * 0.085
+       + fbm(p * 2.90 - vec2(uT * 0.028, 0.0)) * 0.030
+       + fbm(p * 6.30 + vec2(uT * 0.019, uT * 0.011)) * 0.010;
+}
+vec2 curlAmb(vec2 p){
+  const float e = 0.0022;
+  float ay = psiAmb(p + vec2(0.0, e)) - psiAmb(p - vec2(0.0, e));
+  float ax = psiAmb(p + vec2(e, 0.0)) - psiAmb(p - vec2(e, 0.0));
+  return vec2(ay, -ax) / (2.0 * e);
+}
+// A body moving through still water. Psi = M (u x d) exp(-r2/a2); at the
+// centre the fluid moves with the hand, and it curls round the sides. Both
+// terms fall to nothing inside a radius, so the disturbance stays where the
+// hand is instead of reaching across the tray.
+vec2 vHand(vec2 p, vec2 c, vec2 u, float M, float a){
+  vec2 d = p - c;
+  float a2 = max(a * a, 1e-6);
+  float f = exp(-dot(d, d) / a2);
+  float g = u.x * d.y - u.y * d.x;
+  float k = 2.0 / a2;
+  return M * f * vec2(u.x - k * g * d.y, u.y + k * g * d.x);
+}
+// A vortex as a potential hill: tangential, strongest at its own radius.
+vec2 vVort(vec2 p, vec2 c, float G, float a){
+  vec2 d = p - c;
+  float a2 = max(a * a, 1e-6);
+  float f = exp(-dot(d, d) / a2);
+  return G * f * (2.0 / a2) * vec2(-d.y, d.x);
+}
+// A wave packet that travels outward and leaves.
+//
+// This was an oscillator, not a wave. Its envelope was a blob centred on the
+// mark with a wavelength two and a half times wider than the blob itself, so
+// no crest was ever inside it to travel through — the whole lobe simply
+// reversed sign at 2Hz. Something that swings about a rest position is a
+// spring, which is why it felt bouncy and drew an S under a moving hand.
+//
+// Now the envelope is an annulus at radius R, and R grows with the mark's age.
+// Several wavelengths sit inside the packet, so a crest genuinely moves
+// through it; and once it has passed, it is gone rather than swinging back.
+vec2 vRip(vec2 p, vec2 c, float A, float R, float K, float w){
+  vec2 d = p - c;
+  float r = length(d) + 1e-6;
+  float x = r - R;                       // distance from the crest, not the centre
+  float w2 = max(w * w, 1e-6);
+  float env = exp(-x * x / w2);
+  float sn = sin(x * K), cs = cos(x * K);
+  float dpsi = A * env * (K * cs - sn * 2.0 * x / w2);
+  return dpsi * vec2(d.y, -d.x) / r;
+}
+
+vec2 flow(vec2 p){
+  vec2 v = curlAmb(p) * uAmb;
+  v += vHand(p, uHand.xy, uHand.zw, uHandM.x, uHandM.y);
+  for(int i = 0; i < ${NV}; i++)
+    v += vVort(p, uVort[i].xy, uVort[i].z, uVort[i].w);
+  for(int i = 0; i < ${NW}; i++)
+    v += vRip(p, uRipA[i].xy, uRipA[i].z, uRipA[i].w, uRipB[i].x, uRipB[i].y);
+  return v;
+}
+
+/* --- the ink that keeps being made --- */
+void cells(vec2 p, float freq, float tm, out float f1, out float f2,
+           out vec2 id1, out vec2 id2){
+  vec2 P = p * freq, ip = floor(P), fp = fract(P);
+  f1 = 9.0; f2 = 9.0; id1 = ip; id2 = ip;
+  for(int j = -1; j <= 1; j++)
+  for(int i = -1; i <= 1; i++){
+    vec2 g = vec2(float(i), float(j));
+    vec2 q = h2(ip + g);
+    q = 0.5 + 0.43 * sin(tm * (0.22 + 0.34 * q.x) + 6.2831 * q);
+    float d = length(g + q - fp);
+    if(d < f1){ f2 = f1; id2 = id1; f1 = d; id1 = ip + g; }
+    else if(d < f2){ f2 = d; id2 = ip + g; }
+  }
+}
+vec3 inkAt(float n){
+  int i = int(mod(n, 6.0));
+  vec3 c = uInk[0];
+  for(int k = 1; k < 6; k++) if(k == i) c = uInk[k];
+  return c;
+}
+float grainAt(float n){
+  int i = int(mod(n, 6.0));
+  float g = uGrainOf[0];
+  for(int k = 1; k < 6; k++) if(k == i) g = uGrainOf[k];
+  return g;
+}
+
+// Absorbance, not colour. Pigment absorbs light; two washes over each other
+// add their absorbance, and that is what makes overlaps deepen and shift the
+// way real paint does instead of sliding along a line between two RGB values.
+vec4 source(vec2 p, out float spotOut){
+  float A1, A2, B1, B2; vec2 ia, ib, ja, jb;
+
+  // A Voronoi wall is the perpendicular bisector between two seeds — a
+  // straight line — so the cells come out as convex polygons with creases
+  // between them, which is stained glass exactly. Warping the domain before
+  // the cells are looked up bends every one of those bisectors into a curve,
+  // so the panes become lobes and the leading becomes a meander. Two octaves,
+  // because one gives a uniform wobble and reads as an effect.
+  vec2 w = p + vec2(fbm(p * 2.10 + 1.7), fbm(p * 2.10 + 7.1)) * 0.105
+             + vec2(fbm(p * 5.30 + 4.3), fbm(p * 5.30 + 9.7)) * 0.032;
+
+  float base = (uStyle == 2 ? 6.0 : 9.0) * (0.55 + 1.05 * fbm(p * 1.35 + 2.2));
+  cells(w, base,       uT,       A1, A2, ia, ib);
+  cells(w, base * 3.1, uT * 1.4, B1, B2, ja, jb);
+
+  float wallA = (A2 - A1) / max(A2 + A1, 1e-4);
+  float wallB = (B2 - B1) / max(B2 + B1, 1e-4);
+
+  float ka = 1.0 + floor(h21(ia) * 5.0), kb = 1.0 + floor(h21(ib) * 5.0), kf = 1.0 + floor(h21(ja) * 5.0);
+  vec3 ca = inkAt(ka), cb = inkAt(kb), cf = inkAt(kf);
+  vec3 col = mix((ca + cb) * 0.5, ca, smoothstep(0.0, 0.44, wallA));
+  col = mix(col, (col * 0.55 + cf * 0.62), 0.16 + 0.14 * smoothstep(0.30, 0.0, wallB));
+  col *= 1.0 - 0.09 * exp(-wallA * wallA / 0.016) - 0.035 * exp(-wallB * wallB / 0.010);
+
+  if(uStyle == 1){
+    float v = smoothstep(0.30, 0.0, wallA) + 0.7 * smoothstep(0.18, 0.0, wallB);
+    col = mix(col * 1.16, col * 0.42, clamp(v, 0.0, 1.0));
+  } else if(uStyle == 3){
+    float fr = fbm(p * 4.0 + fbm(p * 1.9 + uT * 0.05) * 3.2);
+    col = mix(col, col * (0.60 + 0.72 * fr), 0.68);
+  } else if(uStyle == 4){
+    float rd = smoothstep(0.26, 0.40, A1) - smoothstep(0.42, 0.60, A1);
+    col = mix(col, col * 0.58 + inkAt(kb) * 0.52, rd);
+  }
+  // The markings. A dart frog is a shifting ground with bold round patches of
+  // one dense pigment laid over it — not a blend of everything at once. Spots
+  // are taken from a coarser cell field: near a seed is inside a spot, and the
+  // radius is drawn per seed so they vary the way real ones do. Rather more
+  // than half of the seeds carry one, so the ground still shows.
+  float S1, S2; vec2 sa, sb;
+  cells(w, base * 0.46, uT * 0.55, S1, S2, sa, sb);
+  // Fewer seeds carry a marking and the markings are smaller: on the animal the
+  // colour dominates and the black is webbing between it, not the other way
+  // round. Two in five, at roughly half the radius.
+  float rad  = 0.20 + 0.20 * h21(sa + 11.3);
+  // Both the radius and whether a seed is marked at all are keyed to the nearest
+  // seed's id, and that id changes discontinuously across a cell boundary — so
+  // the marking had a one-pixel cliff along every boundary where two seeds
+  // disagreed. Fading it out before it reaches the wall removes the
+  // discontinuity entirely, and also isolates the spots, which is what they do
+  // on the animal. The band is a pixel wide wherever the field is steep.
+  float wallS = (S2 - S1) / max(S2 + S1, 1e-4);
+  // A fixed, slightly generous band rather than a pixel-thin one. This edge is
+  // injected into ink that is then resampled hundreds of times by the
+  // advection, and a one-pixel edge staircases under that; a soft one cannot.
+  // Sharpening it was what made the jaggies worse, not better.
+  float aa    = 0.055;
+  float spot  = (1.0 - smoothstep(rad - aa, rad + aa, S1))
+              * step(0.60, h21(sa + 3.3))
+              * smoothstep(0.0, 0.17, wallS);
+  // Both references separate their colour the same way: the frog's black
+  // reticulation and the strung white between beads are the same device. So a
+  // marking is black or bone, about one in three being the light one — which
+  // is what keeps saturated colours apart instead of letting them blend.
+  vec3 mark = h21(sa + 21.7) > 0.66 ? uInk[4] : uInk[0];
+  col = mix(col, mark, spot * 0.88);
+  spotOut = spot;
+
+  vec3 absorb = -log(clamp(col, 0.012, 0.999)) * 0.22;   // fits 0..1 for 8-bit
+  float gr = mix(mix(grainAt(ka), grainAt(kb), 0.5), grainAt(0.0), spot * 0.9);
+  return vec4(absorb, gr);
+}
+
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec2 p  = vec2(uv.x * uAsp, uv.y);
+  float spotHere;
+  vec4 src = source(p, spotHere);
+  if(uFirst > 0.5){ o = src; return; }
+
+  // Semi-Lagrangian: this pixel's ink is whatever was upstream of it.
+  vec2 v = flow(p);
+  vec2 back = clamp(toUV(p - v * uDt), vec2(0.0005), vec2(0.9995));
+  vec4 prev = texture(uPrev, back);
+
+  // ODD-EVEN DECOUPLING. When the flow displaces by close to a whole number of
+  // texels — which is most of a vortex, where the velocity barely changes over
+  // a neighbourhood — each texel samples another texel almost exactly, the
+  // bilinear filter does no interpolating, and the even and odd texels stop
+  // being coupled at all. They then evolve as two independent lattices, which
+  // is the checkerboard; the same fault restepping a diagonal every frame is
+  // the sawtooth on an edge.
+  //
+  // Tying each texel to its four neighbours makes those two lattices one again.
+  // A tenth is enough to kill the mode outright and is far too little to read
+  // as blur.
+  vec2 px = 1.0 / uRes;
+  vec4 nb = texture(uPrev, back + vec2(px.x, 0.0))
+          + texture(uPrev, back - vec2(px.x, 0.0))
+          + texture(uPrev, back + vec2(0.0, px.y))
+          + texture(uPrev, back - vec2(0.0, px.y));
+  prev = mix(prev, nb * 0.25, 0.10);
+
+  // And a little new structure, so the sheet keeps growing rather than smearing
+  // itself flat. But this field is computed at the pixel's SCREEN position, so
+  // it does not flow — re-stamping it at full rate prints its edges in the same
+  // place every frame while the ink travels past them, which reads as hard
+  // lines the fluid moves past rather than with. The markings carry by far the
+  // hardest edges in it, so they inject at a fifth of the rate: they still
+  // form, but mostly by being carried rather than by being stamped.
+  o = mix(prev, src, uRegen * mix(1.0, 0.20, spotHere));
+}`;
+
+/* ---------- pass two: light through the ink ---------- */
+const SHOW = `#version 300 es
+${COMMON}
+out vec4 o;
+uniform sampler2D uInkTex;
+uniform vec3 uPaper;
+uniform float uGrain, uT;
+uniform int uStyle, uTex;
+
+// Anything laid over the ink in screen space sits still while the fluid moves
+// underneath it, which is what made the halftone and the lattice read as a
+// solid film stretched across the top. The two textures here are instead
+// applied to the ABSORBANCE — they change how much pigment is held at each
+// point, so they belong to the sheet rather than floating above it. Paper is
+// allowed to be static: real paper does not move. Printed dots are not.
+float fibre(vec2 p){
+  // cold-pressed tooth: fine, and drawn out along the grain direction
+  return fbm(vec2(p.x * 190.0, p.y * 150.0)) * 0.62
+       + fbm(vec2(p.x * 61.0,  p.y * 74.0))  * 0.38;
+}
+
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec2 p  = vec2(uv.x * uAsp, uv.y);
+  vec4 ink = texture(uInkTex, uv);
+  vec3 A = max(ink.rgb, 0.0) * 4.545;                    // undo the storage scale
+
+  // Moire, made from the ink beating against itself rather than from a lattice
+  // thrown over the top. Two samples of the same sheet at slightly different
+  // scale interfere, and because both are the fluid, the interference moves
+  // with it instead of sitting on it like snakeskin.
+  if(uStyle == 2){
+    vec2 c2 = vec2(0.5 * uAsp, 0.5);
+    vec3 B = max(texture(uInkTex, toUV(c2 + (p - c2) * 1.045)).rgb, 0.0) * 4.545;
+    A = mix(A, abs(A - B) * 1.9 + A * 0.55, 0.62);
+  }
+
+  // Granulation: coarse pigment settles into the tooth of the paper, so its
+  // absorbance is modulated by the paper rather than laid flat over it. How
+  // much depends on which pigment it is.
+  float tooth = fbm(p * 78.0 + 3.1) - 0.5;
+  A *= 1.0 + tooth * ink.a * 0.55;
+  // and flocculation — coarse pigment clumps at a larger scale too
+  A *= 1.0 + (fbm(p * 17.0 - 5.5) - 0.5) * ink.a * 0.22;
+
+  // 1 paper — the tooth of the sheet, holding more pigment in its hollows
+  // 2 wash  — the soft mottling of a wash that dried unevenly
+  if(uTex == 1) A *= 0.80 + 0.44 * fibre(p);
+  else if(uTex == 2) A *= 0.84 + 0.34 * fbm(p * 5.5 + 9.0) + 0.14 * fbm(p * 13.0);
+
+  // Beer-Lambert. Light goes down through the wash, off the paper, and back
+  // up through it, so the paper is what is being seen and the ink is what is
+  // taken out of it.
+
+  vec3 col = uPaper * exp(-A * 1.28);
+  col.r *= 1.004; col.b *= 0.996;                   // misregistration, a whisper
+  col += (hash(gl_FragCoord.xy + fract(uT * 7.31) * 97.0) - 0.5) * uGrain;
+  o = vec4(clamp(col, 0.0, 1.0), 1.0);
+}`;
+
+// opts.inks / opts.paper let a caller drive the engine from its own palette
+// without touching the shared one — which is what the colour editor needs.
+function Shader(qual, style, canvas, opts = {}){
+  const INKS  = opts.inks  || inks;
+  const PAPR  = opts.paper || PAPER;
+  const gl = canvas.getContext('webgl2', { antialias:false, alpha:false, depth:false });
+  if(!gl) return null;
+  const float = gl.getExtension('EXT_color_buffer_float');
+  gl.getExtension('OES_texture_float_linear');
+
+  const build = (fs) => {
+    const sh = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src); gl.compileShader(s);
+      if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const pr = gl.createProgram();
+    gl.attachShader(pr, sh(gl.VERTEX_SHADER, VERT));
+    gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(pr);
+    if(!gl.getProgramParameter(pr, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(pr));
+    return pr;
+  };
+  const pSim = build(SIM), pShow = build(SHOW);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  const bindQuad = pr => {
+    const loc = gl.getAttribLocation(pr, 'a');
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  };
+  const U = (pr, n) => gl.getUniformLocation(pr, n);
+
+  /* ---- the two sheets of ink, written to alternately ---- */
+  let texA = null, texB = null, fboA = null, fboB = null, W = 1, H = 1, asp = 1;
+  function alloc(w, h){
+    [texA, texB].forEach(t => t && gl.deleteTexture(t));
+    [fboA, fboB].forEach(f => f && gl.deleteFramebuffer(f));
+    const mk = () => {
+      const t = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      const [ifmt, type] = float ? [gl.RGBA16F, gl.HALF_FLOAT] : [gl.RGBA8, gl.UNSIGNED_BYTE];
+      gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, w, h, 0, gl.RGBA, type, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const f = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+      return [t, f];
+    };
+    [texA, fboA] = mk(); [texB, fboB] = mk();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  const STYLES = ['rings','bands','lattice','sunburst','ziggurat'];
+  let STY = STYLES.indexOf(style);
+  let t = 0, first = true;
+
+  /* ---- the hand ----
+     A hand's ripple in a large body of water stays a hand's width and dies
+     before it crosses the pond. The radius was 0.165 of the tile and grew
+     70% a second, so within two seconds one ripple spanned three quarters of
+     the screen. Both numbers are now a fraction of that. */
+  const RAD   = 0.090;
+  const TAU   = 2.2;
+  const RSPD  = 0.20;    // how fast the ring travels, tile-widths per second
+  const RK    = 110.0;   // wavenumber: about two waves inside the packet
+  const RW    = 0.055;   // packet width — must hold several wavelengths
+  // The flow a packet makes scales with its wavenumber (the crest is steeper),
+  // so amplitude has to be divided by it or raising K silently multiplies the
+  // whole disturbance. Peak ripple speed is set as a fraction of the hand's.
+  const RGAIN = 0.013;
+  const RDISP = 0.30;    // and spread a little as it goes, as real packets do
+  const ATTACK = 16.0;
+  const VTAU   = 2.6;
+
+  const wake = [];
+  for(let i = 0; i < NW; i++) wake.push({ x:0.5, y:0.5, peak:0, age:9, mag:0 });
+  const vort = [];
+  for(let i = 0; i < NV; i++) vort.push({ x:0.5, y:0.5, th:0 });
+  let vi = 0;
+  const head = { x:0.5, y:0.5, ux:1, uy:0, mag:0 };
+  let tx = 0.5, ty = 0.5, qx = 0.5, qy = 0.5, nextGap = 0.063;
+  let vx = 0, vy = 0, on = false, entered = false, lx = 0.5, ly = 0.5;
+  let pux = 1, puy = 0;                              // heading at the last shed
+
+  const hand   = new Float32Array(4);
+  const handM  = new Float32Array(2);
+  const vortU  = new Float32Array(NV * 4);
+  const ripA   = new Float32Array(NW * 4);
+  const ripB   = new Float32Array(NW * 2);
+
+  function pack(){
+    hand[0] = head.x * asp; hand[1] = head.y; hand[2] = head.ux; hand[3] = head.uy;
+    handM[0] = head.mag; handM[1] = RAD;
+    for(let i = 0; i < NV; i++){
+      const v = vort[i];
+      vortU[i*4] = v.x * asp; vortU[i*4+1] = v.y;
+      vortU[i*4+2] = v.th;    vortU[i*4+3] = RAD * 0.85;
+    }
+    for(let i = 0; i < NW; i++){
+      const m = wake[i];
+      const R = m.age * RSPD;                       // the ring has got this far
+      ripA[i*4] = m.x * asp; ripA[i*4+1] = m.y;
+      // amplitude falls as the ring opens: the same energy over a longer
+      // circumference, which is why a real ripple thins as it travels
+      ripA[i*4+2] = m.mag / Math.sqrt(1 + R / RAD);
+      ripA[i*4+3] = R;
+      ripB[i*2]   = RK; ripB[i*2+1] = RW * (1 + m.age * RDISP);
+    }
+  }
+
+  const uS = {}, uW = {};
+  ['uRes','uAsp','uPrev','uT','uDt','uAmb','uFirst','uRegen','uStyle','uHand','uHandM',
+   'uVort[0]','uRipA[0]','uRipB[0]','uInk[0]','uGrainOf[0]'].forEach(n => uS[n] = U(pSim, n));
+  ['uRes','uAsp','uInkTex','uPaper','uGrain','uT','uStyle','uTex'].forEach(n => uW[n] = U(pShow, n));
+
+  let src = 0;   // which texture holds the current ink
+
+  return {
+    // no reset: the new source blends in over about half a second while
+    // the ink already in the tray keeps flowing
+    setStyle(nm){ STY = STYLES.indexOf(nm); },
+    resize(w, h){
+      W = w; H = h; asp = w / h;
+      canvas.width = w; canvas.height = h;
+      alloc(w, h);
+      first = true;
+    },
+    pointer(x, y, dx, dy, o){
+      tx = x; ty = 1 - y;
+      if(o && !entered){ qx = tx; qy = ty; lx = tx; ly = ty; vx = 0; vy = 0; pux = 1; puy = 0; entered = true; }
+      if(!o) entered = false;
+      on = o;
+    },
+    step(dt, ambient){
+      const d = Math.min(0.05, Math.max(0.004, dt || 0.016));
+      if(ambient !== false) t += d;
+
+      for(let i = 0; i < NW; i++){
+        const m = wake[i];
+        if(m.peak <= 0) continue;
+        m.age += d;
+        m.mag = m.peak * (1 - Math.exp(-m.age * ATTACK)) * Math.exp(-m.age / TAU);
+        if(m.mag < 1e-6 || m.age > 6){ m.peak = 0; m.mag = 0; }
+      }
+      const vd = Math.exp(-d / VTAU);
+      const A2 = (RAD * 0.85) * (RAD * 0.85);
+      for(let i = 0; i < NV; i++){
+        const v = vort[i];
+        v.th *= vd;
+        if(Math.abs(v.th) < 1e-4) continue;
+
+        // carried by the current it is sitting in
+        const [cx0, cy0] = jcurl(v.x * asp, v.y, t);
+        let dx = cx0 * 0.55, dy = cy0 * 0.55;
+
+        // pulled about by the other vortices — this is what makes a pair orbit
+        // each other and a cluster wander instead of standing still
+        for(let k = 0; k < NV; k++){
+          if(k === i) continue;
+          const o = vort[k];
+          if(Math.abs(o.th) < 1e-4) continue;
+          const ex = v.x - o.x, ey = v.y - o.y;
+          const g = o.th * Math.exp(-(ex * ex + ey * ey) / A2) * 2 / A2;
+          dx += -ey * g; dy += ex * g;
+        }
+
+        // and pushed by the hand, if it is near
+        if(on && head.mag > 1e-4){
+          const ex = v.x - head.x, ey = v.y - head.y;
+          const f = Math.exp(-(ex * ex + ey * ey) / (RAD * RAD));
+          const gg = head.ux * ey - head.uy * ex;
+          dx += head.mag * f * (head.ux - 2 * gg * ey / (RAD * RAD));
+          dy += head.mag * f * (head.uy + 2 * gg * ex / (RAD * RAD));
+        }
+        v.x += dx * d; v.y += dy * d;
+      }
+      // Co-rotating vortices orbit one another and then coalesce. That is how a
+      // fluid actually gathers spin, and without it the drift defeats the whole
+      // thing: each new shed lands beside a vortex that has since wandered off,
+      // so you get a scatter of weak eddies instead of one deep whirl.
+      for(let i = 0; i < NV; i++){
+        const A = vort[i];
+        if(Math.abs(A.th) < 1e-4) continue;
+        for(let k = i + 1; k < NV; k++){
+          const B = vort[k];
+          if(Math.abs(B.th) < 1e-4 || A.th * B.th <= 0) continue;
+          const ex = A.x - B.x, ey = A.y - B.y;
+          if(ex * ex + ey * ey > (RAD * 0.95) * (RAD * 0.95)) continue;
+          const wa = Math.abs(A.th), wb = Math.abs(B.th), tw = wa + wb;
+          A.x = (A.x * wa + B.x * wb) / tw;
+          A.y = (A.y * wa + B.y * wb) / tw;
+          A.th = Math.max(-0.16, Math.min(0.16, A.th + B.th));
+          B.th = 0;
+        }
+      }
+      // ripple origins drift too — a ring spreads from where the water is now,
+      // not from where it was when the water was struck
+      for(let i = 0; i < NW; i++){
+        const m = wake[i];
+        if(m.peak <= 0) continue;
+        const [rx, ry] = jcurl(m.x * asp, m.y, t);
+        m.x += rx * 0.45 * d; m.y += ry * 0.45 * d;
+      }
+
+      if(!on){ head.mag *= Math.exp(-d / 0.55); qx = tx; qy = ty; return; }
+
+      const k = 1 - Math.exp(-d / 0.045);
+      vx += ((tx - qx) / d - vx) * k;
+      vy += ((ty - qy) / d - vy) * k;
+      qx = tx; qy = ty;
+      const sp = Math.hypot(vx, vy);
+
+      head.x = tx; head.y = ty;
+      if(sp > 1e-4){ head.ux = vx / sp; head.uy = vy / sp; }
+      const want = Math.min(1.2, sp * 0.55);
+      head.mag += (want - head.mag) * (1 - Math.exp(-d / 0.06));
+
+      if(Math.hypot(tx - lx, ty - ly) < nextGap || head.mag < 0.004) return;
+
+      let qi = 0;
+      for(let i = 1; i < NW; i++) if(wake[i].mag < wake[qi].mag) qi = i;
+      const m = wake[qi];
+      m.x = tx; m.y = ty; m.peak = head.mag * RGAIN / RK; m.age = 0; m.mag = 0;
+
+      // WHICH WAY THE VORTEX TURNS FOLLOWS THE PATH.
+      //
+      // Shedding strictly left-right is a von Karman street, which is right for
+      // something moving in a straight line — and it is what stopped the drag
+      // stamping mushrooms. But circling then lays down +,-,+,- around the loop
+      // and the net circulation comes to nothing, so you got a necklace of
+      // little counter-turning curls instead of one whirl.
+      //
+      // A body that is turning does not shed symmetrically: it sheds biased
+      // into its turn. So the heading change since the last shed decides. Going
+      // straight, this alternates exactly as before. Winding a circle, every
+      // shed takes the sign of the turn and they add up.
+      const cross = pux * head.uy - puy * head.ux;   // + turning one way, - the other
+      const turn  = Math.max(-1, Math.min(1, cross * 4.0));
+      const w     = Math.abs(turn);
+      const alt   = (vi++ & 1) ? 1 : -1;
+      const signed = alt * (1 - w) + Math.sign(turn) * w;
+      const jit  = 0.75 + Math.random() * 0.5;       // nothing in water is metronomic
+      const sd   = signed >= 0 ? 1 : -1;
+      const ox = -head.uy * RAD * 0.75 * sd, oy = head.ux * RAD * 0.75 * sd;
+      const vxp = tx + ox, vyp = ty + oy;
+      const th = Math.min(0.045, sp * 0.018) * signed * jit;
+
+      // AND LIKE-SIGNED VORTICES MERGE, which is how a fluid accumulates spin.
+      // Without this each lap only replaced the last one's work and nothing
+      // could ever wind up.
+      let mi = -1;
+      for(let i = 0; i < NV; i++){
+        const v = vort[i];
+        if(Math.abs(v.th) > 1e-4 && v.th * th > 0 &&
+           Math.hypot(v.x - vxp, v.y - vyp) < RAD * 1.4){ mi = i; break; }
+      }
+      if(mi >= 0){
+        const v = vort[mi];
+        // was 0.7, which hit the ceiling in a third of one lap. This is about
+        // four laps of steady winding, so it builds where you can see it.
+        v.th = Math.max(-0.16, Math.min(0.16, v.th + th * 0.10));
+        v.x += (vxp - v.x) * 0.3; v.y += (vyp - v.y) * 0.3;
+      } else {
+        let qv = 0;
+        for(let i = 1; i < NV; i++) if(Math.abs(vort[i].th) < Math.abs(vort[qv].th)) qv = i;
+        const v = vort[qv]; v.x = vxp; v.y = vyp; v.th = th;
+      }
+
+      pux = head.ux; puy = head.uy;
+      lx = tx; ly = ty;
+      nextGap = RAD * (0.55 + Math.random() * 0.5);
+    },
+    draw(dt, ambient){
+      const d = Math.min(0.05, Math.max(0.004, dt || 0.016));
+      pack();
+
+      /* --- move the ink --- */
+      gl.useProgram(pSim); bindQuad(pSim);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, src ? fboA : fboB);
+      gl.viewport(0, 0, W, H);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, src ? texB : texA);
+      gl.uniform1i(uS['uPrev'], 0);
+      gl.uniform2f(uS['uRes'], W, H);
+      gl.uniform1f(uS['uAsp'], asp);
+      gl.uniform1f(uS['uT'], t);
+      gl.uniform1f(uS['uDt'], d);
+      gl.uniform1f(uS['uAmb'], ambient === false ? 0 : 1);
+      gl.uniform1f(uS['uFirst'], first ? 1 : 0);
+      gl.uniform1f(uS['uRegen'], 0.030);
+      gl.uniform1i(uS['uStyle'], STY);
+      gl.uniform4fv(uS['uHand'], hand);
+      gl.uniform2fv(uS['uHandM'], handM);
+      gl.uniform4fv(uS['uVort[0]'], vortU);
+      gl.uniform4fv(uS['uRipA[0]'], ripA);
+      gl.uniform2fv(uS['uRipB[0]'], ripB);
+      gl.uniform3fv(uS['uInk[0]'], INKS(STY).flat());
+      gl.uniform1fv(uS['uGrainOf[0]'], GRAIN_OF);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      first = false;
+      src = src ? 0 : 1;
+
+      /* --- and light it --- */
+      gl.useProgram(pShow); bindQuad(pShow);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, W, H);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, src ? texB : texA);
+      gl.uniform1i(uW['uInkTex'], 0);
+      gl.uniform2f(uW['uRes'], W, H);
+      gl.uniform1f(uW['uAsp'], asp);
+      gl.uniform3fv(uW['uPaper'], PAPR());
+      gl.uniform1f(uW['uGrain'], 0.016);
+      gl.uniform1f(uW['uT'], t);
+      gl.uniform1i(uW['uStyle'], STY);
+      gl.uniform1i(uW['uTex'], STATE.texture);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+  };
+}
+
+/* --- page --- */
 
 /* No texture overlay: the paper and wash options are gone, so the only thing
    on screen is the fluid itself. Granulation stays, because that lives in the
